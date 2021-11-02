@@ -1,0 +1,19 @@
+Package: jmseq
+Title: Fit a joint model for longitudinal measurements and time to event by sequential Bayesian updating
+Version: 0.0.0.9000
+Authors@R: 
+    person(given = "Paul",
+           family = "McKeigue",
+           role = c("aut", "cre"),
+           email = "paul.mckeigue@ed.ac.uk",
+           comment = c(ORCID = "YOUR-ORCID-ID"))
+Description: "Fit a joint model for longitudinal measurements and time to event by sequential Bayesian updating."
+License: `use_gpl3_license()` 
+Encoding: UTF-8
+LazyData: false
+Roxygen: list(markdown = TRUE)
+RoxygenNote: 7.1.1
+Depends: 
+    R (>= 2.10), ctsem, pROC
+Imports: 
+    ctsem, pROC, data.table
