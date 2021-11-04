@@ -6,14 +6,18 @@ Authors@R:
            family = "McKeigue",
            role = c("aut", "cre"),
            email = "paul.mckeigue@ed.ac.uk",
-           comment = c(ORCID = "YOUR-ORCID-ID"))
+           comment = c(ORCID = "0000-0002-5217-1034"))
 Description: "Fit a joint model for longitudinal measurements and time to event by sequential Bayesian updating."
-License: `use_gpl3_license()` 
+License: `use_gpl_license()` 
 Encoding: UTF-8
 LazyData: false
 Roxygen: list(markdown = TRUE)
-RoxygenNote: 7.1.1
+RoxygenNote: 7.1.2
 Depends: 
-    R (>= 2.10), ctsem, pROC
+    R (>= 2.10), pROC, data.table, parallel
 Imports: 
-    ctsem, pROC, data.table
+    ctsem, ggplot2
+Suggests: 
+    rmarkdown,
+    knitr
+VignetteBuilder: knitr
