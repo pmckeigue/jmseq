@@ -1,0 +1,164 @@
+---
+title: "jmseq"
+author: Paul McKeigue
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{jmseq}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r, include = FALSE, eval = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>"
+)
+```
+
+```{r setup, eval=FALSE}
+library(jmseq)
+library(data.table)
+
+## Options
+knitr::opts_chunk$set(echo = TRUE)
+rstan::rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+ggplot2::theme_set(ggplot2::theme_light(base_size = 8))
+
+data(pbc, package="jmseq") # load("pbc_forjm.RData")
+list2env(pbc, envir=environment())
+
+nfolds <- 4
+landmark.time <- 5
+maxtime <- 15
+set.seed <- 1234
+
+## minimum interval between biomarker observations as guide to setting timestep
+dataLong.melted <- data.table::melt(data=dataLong, id.vars=c("id", "Time"), measure.vars=biomarkers)
+dataLong.melted <- na.omit(dataLong.melted)
+data.table::setorder(dataLong.melted, Time)
+min.diff <- min(dataLong.melted[, diff(Time), by=list(id, variable)][["V1"]])
+cat("Minimum interval between biomarker observations", min.diff, "\n")
+
+timestep <- 60 / 365.25
+
+rows.tosample <- which(dataSurv$Time > landmark.time) # & dataSurv$Time < max(dataSurv$Time))
+rows.permuted <- base::sample(rows.tosample)
+## test-train split for nfold cross-validation
+folds <- cut(1:length(rows.permuted), breaks=nfolds, labels=FALSE)
+
+## create list of ids in each testfolds 
+ids.test <- vector("list", nfolds)
+for(i in 1:nfolds) {
+    ids.test[[i]] <- dataSurv[rows.permuted[folds==i], id]
+}
+
+## create training datasets
+train.datasets <- vector("list", nfolds)
+for(i in 1:nfolds) {
+    train.datasets[[i]] <- vector("list", 3)
+    names(train.datasets[[i]]) <- c("Surv", "Long", "ids.test")
+    train.datasets[[i]]$Surv <- trainsplit.surv(ids.test=ids.test[[i]],
+                                                dataSurv=dataSurv,
+                                                landmark.time=landmark.time) 
+    train.datasets[[i]]$Long <- trainsplit.long(ids.test[[i]],
+                                                train.datasets[[i]]$Surv,
+                                                dataLong, landmark.time,
+                                                biomarkers)
+    train.datasets[[i]]$ids.test <- ids.test[[i]]
+}
+
+## create list of models
+models.list <- listmodels(biomarkers, timeinvar.long)[c(1, 5)]
+
+## mclapply and foreach %dopar% fail -- child processes cannot open sockets
+start <- Sys.time()
+cl <- makePSOCKcluster(8)
+fitted.list <- vector("list", length(models.list))
+names(fitted.list) <- names(models.list)
+cat("Looping over ctsem models to fit to training datasets ...\n")
+for(m in 1:length(models.list)) {
+    fitted.list[[m]] <- 
+     #lapply(X=train.datasets, FUN=ctstanfit.fold, ctmodel=models.list[[m]]) 
+     parLapply(cl, X=train.datasets, fun=ctstanfit.fold, ctmodel=models.list[[m]]) 
+     gc()
+    names(fitted.list[[m]]) <- paste0("fold", 1:nfolds)
+}
+stopCluster(cl)
+cat("done, time ", difftime(Sys.time(), start, "mins"), "minutes\n")
+
+compare <- NULL
+for(m in 1:length(fitted.list)) {
+        s <- summary(fitted.list[[m]][[1]])
+        compare <- rbind(compare,
+                         data.frame(loglik=s$loglik, npars=s$npars, aic=s$aic))
+}
+compare <- data.table(model=names(models.list), compare)
+
+## plot imputed values for first five individuals
+png("kalmanfilter.png", width=600, height=400)
+ctsem::ctKalman(fit=fitted.list[[length(fitted.list)]][[1]], kalmanvec=c("y", "yprior"),
+         subjects=1:5, plot=TRUE)
+dev.off()
+
+## generate imputations from each training fold within each ctsem model 
+start <- Sys.time()
+cat("Looping over ctsem models to generate imputations from Kalman filter ...\n")
+kalwide.list <- vector("list", length(models.list))
+names(kalwide.list) <- names(models.list)
+for(m in 1:length(models.list)) {
+    kalwide.list[[m]] <- mcmapply(FUN=kalmanwide,
+                                fitted.list[[m]],
+                                MoreArgs=list(timestep=timestep,
+                                              maxtime=maxtime),
+                                SIMPLIFY=FALSE)
+}
+cat("done, time ",  difftime(Sys.time(), start, "mins"), "minutes\n")
+
+## fit Poisson model to training datasets for each fold within each ctsem model
+poisson.glm.train <- vector("list", length(models.list))
+for(m in 1:length(models.list)) {
+    poisson.glm.train[m] <- vector("list", length(nfolds))
+    for(fold in 1:nfolds) {
+        poisson.glm.train[[m]][[fold]] <- train.poissontsplit(kalwide.list[[m]][[fold]],
+                                                   train.datasets[[fold]]$Surv,
+                                                   timeinvar.surv, biomarkers, splines=FALSE)
+    }
+}
+names(poisson.glm.train) <- names(models.list)
+## print coefficients for first model fitted to first training fold
+print(summary(poisson.glm.train[[1]][[1]])$coefficients,
+      digits=c(2, 2, 2, 3),
+      caption="Poisson time-splitting model fitted to latent biomarker values imputed by Kalman filter from linear mixed model with diffusion and drift")
+
+## generate predictions on test folds 
+## elements of testdata.list are concatenations of all test folds 
+testdata.list <- vector("list", length(models.list))
+for(m in 1:length(models.list)) {
+    testdata.model.list <- mapply(FUN=test.imputed,
+                                   poisson.glm.train[[m]],
+                                   ids.test,
+                                   kalwide.list[[m]],
+                                   MoreArgs=list(dataSurv=dataSurv,
+                                                 landmark.time,
+                                                 timeinvar.surv,
+                                                 biomarkers),
+                           SIMPLIFY=FALSE)
+    testdata.list[[m]] <- data.table::rbindlist(testdata.model.list)
+}
+names(testdata.list) <- names(models.list)
+
+## generate summary table of predictive performance
+predict.table <- NULL
+for(i in 1:length(testdata.list)) {
+    stats <- tabulate.predictions(testdata.list[[i]])
+    predict.table <- rbind(predict.table, stats)
+}
+predict.table <- data.table(Model=names(testdata.list), predict.table)
+predict.table[, Predicted := as.numeric(Predicted)]
+predict.table[, `Person-years` := as.numeric(`Person-years`)]
+predict.table [, `Log score` := as.numeric(`Log score`)]
+predict.table[, `C-statistic` := as.numeric(`C-statistic`)]
+
+
+```
