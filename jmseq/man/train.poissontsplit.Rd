@@ -20,6 +20,8 @@ train.poissontsplit(
 \item{timeinvar.surv}{Character vector of names of time-invariant covariates in dataSurv.train}
 
 \item{biomarkers}{Character vector of names of biomarkers in dataSurv.train.}
+
+\item{splines}{Logical variable as to whether to model time as a spline function.}
 }
 \value{
 Object of class glm containing fitted Poisson regression model.

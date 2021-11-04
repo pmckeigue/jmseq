@@ -2,7 +2,7 @@
 % Please edit documentation in R/jmseqfunctions.R
 \name{listmodels}
 \alias{listmodels}
-\title{Generate list of five stanct models: linear mixed model (LMM), autoregressive drift and Wiener diffusion process only, LMM + drift, LMM + diffusion, LMM + drift + diffusion}
+\title{Generate list of five ctStan models: linear mixed model (LMM), autoregressive drift and Wiener diffusion process only, LMM + drift, LMM + diffusion, LMM + drift + diffusion}
 \usage{
 listmodels(biomarkers, timeinvar.long)
 }
@@ -15,7 +15,7 @@ listmodels(biomarkers, timeinvar.long)
 List of five objects of class ctStanModel.
 }
 \description{
-Generate list of five stanct models: linear mixed model (LMM), autoregressive drift and Wiener diffusion process only, LMM + drift, LMM + diffusion, LMM + drift + diffusion
+Generate list of five ctStan models: linear mixed model (LMM), autoregressive drift and Wiener diffusion process only, LMM + drift, LMM + diffusion, LMM + drift + diffusion
 }
 \examples{
 data(pbc)

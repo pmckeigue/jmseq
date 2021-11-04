@@ -23,6 +23,8 @@ test.imputed(
 
 \item{dataSurv}{Data.table with column id used to fit ctsem model.}
 
+\item{landmark.time}{Landmark time for start of prediction, as numeric variable.}
+
 \item{timeinvar.surv}{Character vector of names of time-invariant covariates in dataSurv.train.}
 
 \item{biomarkers}{Character vector of names of biomarkers in dataSurv.train.}
