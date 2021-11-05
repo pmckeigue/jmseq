@@ -14,7 +14,7 @@ LazyData: false
 Roxygen: list(markdown = TRUE)
 RoxygenNote: 7.1.2
 Depends: 
-    R (>= 2.10), pROC, data.table, parallel
+    R (>= 3.5), pROC, data.table, parallel
 Imports: 
     ctsem, ggplot2
 Suggests: 

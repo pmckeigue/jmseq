@@ -13,6 +13,12 @@ knitr::opts_chunk$set(
   collapse = TRUE,
   comment = "#>"
   )
+
+# devtools::check(vignettes=FALSE)
+# devtools::document()
+# devtools::build(vignettes=FALSE)
+# R CMD INSTALL --library=~/R/x86_64-pc-linux-gnu-library/3.6 ./jmseq_0.0.0.9000.tar.gz
+
 ```
 
 Joint modelling of longitudinal and time to event data can be efficiently implemented by sequential Bayesian updating.  
@@ -24,6 +30,8 @@ This vignette demonstrates an approximate two-step procedure, in which a linear 
 library(jmseq)
 library(data.table)
 
+poissonglm.model <- rstan::stan_model(file="jmseq/stan/poissonglm.stan")
+ 
 opt_evalall <- TRUE # set this to TRUE to evaluate all code in the Rmarkdown source
 
 ## Options
@@ -182,7 +190,7 @@ poisson.glm.train <- vector("list", length(models.list))
 for(m in 1:length(models.list)) {
     poisson.glm.train[m] <- vector("list", length(nfolds))
     for(fold in 1:nfolds) {
-        poisson.glm.train[[m]][[fold]] <- train.poissontsplit(kalwide.list[[m]][[fold]],
+        poisson.glm.train[[m]][[fold]] <- fit.poissontsplit(kalwide.list[[m]][[fold]],
                                                    train.datasets[[fold]]$Surv,
                                                    timeinvar.surv, biomarkers, splines=FALSE)
     }
@@ -196,10 +204,10 @@ A table of the regression coefficients for the linear mixed model fitted to the 
 ```{r printcoeffs, eval=TRUE}
 
 ## print coefficients for first model fitted to first training fold
-coeffs <- summary(poisson.glm.train[[1]][[1]])$coefficients
-coeffs <- data.table(Effect=rownames(coeffs), coeffs)
+coeffs <- poisson.glm.train[[1]][[1]]
+coeffs <- data.table(Effect=names(coeffs), coeffs)
 knitr::kable(coeffs,
-      digits=c(0, 2, 2, 2, 3),
+      digits=c(0, 2),
       caption="Poisson time-splitting model fitted to latent biomarker values imputed by Kalman filter from linear mixed model with diffusion and drift")
 
 ```
@@ -236,6 +244,7 @@ predict.table[, Predicted := as.numeric(Predicted)]
 predict.table[, `Person-years` := as.numeric(`Person-years`)]
 predict.table [, `Log score` := as.numeric(`Log score`)]
 predict.table[, `C-statistic` := as.numeric(`C-statistic`)]
+
 ```
 
 The fit of the longitudinal submodels, and the cross-validated predictive performance of the event submodels, are summarised in a table. 
