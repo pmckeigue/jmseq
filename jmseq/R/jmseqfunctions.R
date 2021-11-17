@@ -1,4 +1,5 @@
-
+#poissonglm.model <- rstan::stan_model(file="./jmseq/stan/poissonglm.stan", verbose=TRUE)
+ 
 #' Generate list of five ctStan models: linear mixed model (LMM), autoregressive drift and Wiener diffusion process only, LMM + drift, LMM + diffusion, LMM + drift + diffusion 
 #'
 #' @param biomarkers Character vector of names of biomarkers.
@@ -76,6 +77,77 @@ listmodels <- function(biomarkers, timeinvar.long) {
     return(models.list)
 }
 
+#' Split intervals of dataSurv and dataLong so that no interval is longer than max.interval
+#'
+#' @param dataSurv data table with one row per individual
+#' @param dataLong data table with one row per biomarker observation
+#' @param max.interval maximum interval length
+#' @return data.table with one observation per interval
+split.SurvLong <- function(dataSurv, dataLong, max.interval=1) {
+    ids <- dataSurv$id
+
+    ## left join dataLong with dataSurv on id
+    setkey(dataLong, id)
+    setkey(dataSurv, id)
+    keep.cols <- c("id", "Time", "Time.cens", "event", timeinvar.surv, biomarkers)
+    survLong <- dataSurv[dataLong]
+    survLong <- survLong[, ..keep.cols]
+    setorder(survLong, id, Time)
+    survLong[, obsnum := .I, by=id]
+    survLong[, lastobs := obsnum==max(obsnum), by=id]
+    survLong[lastobs==FALSE, event := 0]
+    
+    ## add column for interval length
+    survLong[, tstop := shift(Time, type="lead"), by=id]
+    survLong[is.na(tstop), tstop := Time.cens]
+    survLong[, interval.length := tstop - Time]
+    ## add interval number in unsplit dataset
+    survLong[, orig.interval := .I, by=id]
+    
+    cut.times <- cut.intervals(id=survLong$id, tstart=survLong$Time,
+                               interval=survLong$interval.length, max.interval)
+
+    ## loop over individuals to split intervals
+    surv.cut <- NULL
+    for(indiv in ids) {
+        survlong.indiv <- survival::survSplit(formula=Surv(Time, tstop, event) ~ .,
+                                              data=survLong[id==indiv],
+                                              cut=cut.times[id==indiv, split.time])
+        surv.cut <- rbind(surv.cut, survlong.indiv)
+    }
+    
+    surv.cut <- as.data.table(surv.cut)
+    ## set biomarker observations for split intervals to missing
+    surv.cut[, splitinterval := c(1, diff(id)) + c(1, diff(orig.interval)) == 0]
+    surv.cut[splitinterval == TRUE,
+             (biomarkers) := lapply(.SD, function(x) rep(NA, length(x))),
+             .SDcols=biomarkers]
+    
+    surv.cut[, splitinterval := NULL]
+    return(surv.cut)
+}
+
+#' Split intervals so that no interval is longer than max.interval
+#'
+#' @param id Vector of ids.
+#' @param tstart Vector of start times
+#' @param interval.length Vector of lengths of intervals
+#' @param max.interval Maximum interval length in output
+#' @return data.table with colums id, cut.time that can be used to loop over ids calling survSplit. 
+cut.intervals <- function(id, tstart, interval.length, max.interval) {
+    cut.times <- NULL
+    for(i in 1:length(tstart)) {
+        if(interval.length[i] > max.interval) {
+            tstarts <- tstart[i] +
+                max.interval * (1:floor(interval.length[i] / max.interval))
+            tstarts <- data.table(id=rep(id[i], length(tstarts)),
+                                  split.time=tstarts)
+            cut.times <- rbind(cut.times, tstarts)
+        }
+    }
+    return(cut.times)
+}
+
 #' Test/train split of survival table, censoring follow-up at landmark.time for individuals in ids.test
 #'
 #' @param ids.test Vector of individual identifiers.
@@ -85,17 +157,12 @@ listmodels <- function(biomarkers, timeinvar.long) {
 #' 
 #' @export
 trainsplit.surv <- function(ids.test, dataSurv, landmark.time) {
-    stopifnot(all(c("id", "Time.cens", "event") %in% names(dataSurv)))
-    dataSurv.train <- data.table::copy(dataSurv) ## ? otherwise dataSurv will be modified by reference
-    rows.censor <- which(dataSurv.train$id %in% ids.test)
-    dataSurv.train <- as.data.table(dataSurv.train)
-    stopifnot(is.data.table(dataSurv.train) == TRUE)
-    dataSurv.train[rows.censor, event := 0]
-    dataSurv.train[rows.censor, Time.cens := landmark.time]
+    stopifnot(all(c("id", "Time", "tstop", "event") %in% names(dataSurv)))
+    dataSurv.train <- dataSurv[!(id %in% ids.test & tstop > landmark.time)]
     return(dataSurv.train)
 }
 
-#' Test/train split of longitudinal measurements, censoring follow-up at landmark.time for all individuals in ids.test
+#' Test/train split of longitudinal measurements, setting all biomarker measurements after  landmark.time to missing for all individuals in ids.test
 #'
 #' @param ids.test Vector of individual identifiers.
 #' @param dataSurv.train Data.table with columns id = individual identifier, Time.cens = time of exit.
@@ -106,17 +173,10 @@ trainsplit.surv <- function(ids.test, dataSurv, landmark.time) {
 #'
 #'
 #' @export
-trainsplit.long <- function(ids.test, dataSurv.train, dataLong, landmark.time=5, biomarkers) {
-    stopifnot(all(c("id", biomarkers) %in% names(dataLong)))
-    data.table::setkey(dataSurv.train, id)
-    data.table::setkey(dataLong, id)
-    dataLong.train <- dataSurv.train[, .(id, Time.cens)][dataLong]
-    dataLong.train <- dataLong.train[Time < Time.cens]
-    ## add a record for each individual with Time := landmark.time and missing biomarker values
-    dataLong.lmtime <- unique(dataLong.train[id %in% ids.test], by="id")
-    dataLong.lmtime[, Time := landmark.time]
-    dataLong.lmtime[, (biomarkers) := NA]
-    dataLong.train <- rbind(dataLong.train, dataLong.lmtime) 
+trainsplit.long <- function(ids.test, dataLong, landmark.time=5, biomarkers) {
+    stopifnot(all(c("id", "Time", "tstop", biomarkers) %in% names(dataLong)))
+    dataLong.train <- copy(dataLong)
+    dataLong.train[id %in% ids.test & Time > landmark.time, (biomarkers) := NA] 
     return(dataLong.train)
 }
 
@@ -128,7 +188,10 @@ trainsplit.long <- function(ids.test, dataSurv.train, dataLong, landmark.time=5,
 #' 
 #' @export
 ctstanfit.fold <- function(train.dataset, ctmodel) {
-    ctsem::ctStanFit(datalong=train.dataset$Long,
+    if("Long" %in% names(train.dataset)) {
+        train.dataset <- train.dataset$Long
+    }
+    ctsem::ctStanFit(datalong=train.dataset, ## subset Long element in call to function
               ctstanmodel=ctmodel,
               nopriors=FALSE,
               cores=1, optimise=TRUE)
@@ -138,19 +201,26 @@ ctstanfit.fold <- function(train.dataset, ctmodel) {
 #' 
 #' @param train.fit Object of class ctstanfit.
 #' @param timestep Interval length.
-#' @param maxtime Maximum time up to which to generate imputations.
+#' @param subjects Vector of ids in field subject of train.fit
+#' @param timerange Vector of length 2: start and end of time range. 
 #' @return Data.table of imputed values with time in column tstart. 
 #' 
 #' @export
-kalmanwide <- function(train.fit, timestep, maxtime=maxtime) {
+kalmanwide <- function(train.fit, subjects="all", timestep, timerange) {
+    ## on training folds, call with timestep="asdata", timerange=c(0, maxtime), subjects=unique(train.fit$data$subject)
+    ## on test folds, call with timestep=timestep" and timerange=c(landmark.time, maxtime), subjects=ids.test[[fold]]
+    
     stopifnot(class(train.fit)=="ctStanFit")
     ## removeObs=FALSE ensures that observed biomarker values from train.fit are used in imputation
     ## ctKalman option timestep takes arguments "auto" or "asdata"
-    ## "auto" gives sd(time) / 50 
+    ## "auto" gives sd(time) / 50
+    if(subjects=="all") {
+        subjects <- unique(train.fit$data$subject)
+    }
     kal.tsplit <- ctsem::ctKalman(fit=train.fit,
-                           timerange=c(0, maxtime),
+                           timerange=timerange,
                            timestep=timestep, 
-                           subjects=unique(train.fit$data$subject), 
+                           subjects=subjects, 
                            removeObs=FALSE, plot=FALSE)
     kal.tsplit <- as.data.table(kal.tsplit)
     kal.tsplit <- kal.tsplit[Element=="yupd"]
@@ -162,29 +232,35 @@ kalmanwide <- function(train.fit, timestep, maxtime=maxtime) {
     return(kal.wide)
 }
 
+# kal.test <- impute.test(train.fit, landmark.time, maxtime)
+
+
 #' Merge imputed biomarker values with survival data.table and fit Poisson regression model
 #' 
 #' @param kal.wide Data.table of imputed biomarker values, with time in column named tstart.     
 #' @param dataSurv Data.table of survival values with columns id, Time.cens, event
 #' @param timeinvar.surv Character vector of names of time-invariant covariates in dataSurv.train
 #' @param biomarkers Character vector of names of biomarkers in dataSurv.train.
-#' @param splines Logical variable as to whether to model time as a spline function. 
+#' @param splines Logical variable as to whether to model time as a spline function.
+#' @param stan Logical variable whether to use Stan to fit the Poisson regression
+#' @param vb Logical variable whether to use variational Bayes approximation rather than optimising. 
 #' @return Matrix of regression coefficients with one column.
 #' 
 #' @export
 fit.poissontsplit <- function(kal.wide, dataSurv, timeinvar.surv, biomarkers,
-                                splines=FALSE) {
+                                splines=FALSE, stan=TRUE, vb=TRUE) {
     ## left join dataSurv with biomarkers imputed at intervals of length timestep, to fit Poisson regression model
-    setkey(dataSurv, id)
+    setkey(dataSurv, id, Time)
+    setkey(kal.wide, id, tstart)
     tsplit.Surv <- kal.wide[dataSurv]
-    tsplit.Surv[, tstop := c(tstart[-1], NA), by=id]
-    tsplit.Surv[is.na(tstop), tstop := Time.cens]
+    #tsplit.Surv[, tstop := c(tstart[-1], NA), by=id]
+    #tsplit.Surv[is.na(tstop), tstop := Time.cens]
     ## set event indicator to 0 for all person-time intervals ending before censoring date
-    tsplit.Surv[tstop < Time.cens, event := 0]
+    #tsplit.Surv[tstop < Time.cens, event := 0]
     ## restrict to person-time intervals before censoring date
-    tsplit.Surv <- tsplit.Surv[tstart < Time.cens]
+    #tsplit.Surv <- tsplit.Surv[tstart < Time.cens]
     ## calculate tobs within each interval
-    tsplit.Surv[, tobs := pmin(tstop, Time.cens) - tstart]
+    tsplit.Surv[, tobs := tstop - tstart]
     
     keep.vars <- c("id", "event", "tstart", "tstop", "tobs",
                    timeinvar.surv, biomarkers)
@@ -200,7 +276,6 @@ fit.poissontsplit <- function(kal.wide, dataSurv, timeinvar.surv, biomarkers,
                           paste(biomarkers, collapse=" + "))),
         data=tsplit.Surv)
 
-    stan <- TRUE
     if(stan) {
         data.stan <- list(N=nrow(X),
                           P=ncol(X) - 1,
@@ -208,23 +283,79 @@ fit.poissontsplit <- function(kal.wide, dataSurv, timeinvar.surv, biomarkers,
                           logtobs=log(tsplit.Surv$tobs), 
                           y=tsplit.Surv$event)
 
-        #poissonglm.model <- rstan::stan_model(file="jmseq/stan/poissonglm.stan")
-        #poissonglm.model <- poissonglm.stanmodel()
-        poissonglm.opt <- rstan::optimizing(poissonglm.model,
-                                        #tol_rel_obj=0.005, elbo_samples=200, grad_samples=2,
-                                        #pars=c("beta0", "beta"),
-                                            data=data.stan)
-        coeffs.opt <- poissonglm.opt$par
-        beta <- coeffs.opt[grep("beta", names(coeffs.opt))]
-        names(beta) <- colnames(X)
+        if(vb) {
+        poissonglm.vb <- rstan::vb(poissonglm.model,
+                                                tol_rel_obj=0.005,
+                                                elbo_samples=200, grad_samples=2,
+                                                pars=c("beta0", "beta"),
+                                   data=data.stan)
+        coeffs <- as.data.frame(rstan::summary(poissonglm.vb, probs=c(0.025, 0.975))$c_summary)
+        coeffs <- coeffs[1:(nrow(coeffs) - 1), ]
+        } else {
+         poissonglm.opt <- rstan::optimizing(poissonglm.model,
+                                             data=data.stan)
+         coeffs.opt <- poissonglm.opt$par
+         coeffs <- coeffs.opt[grep("beta", names(coeffs.opt))]
+         coeffs <- matrix(coeffs, ncol=1)
+        }
+        rownames(coeffs) <- colnames(X)
     } else {
         poissonglm.fit <- glm.fit(x=X, y=tsplit.Surv$event,
                                   family=poisson(), offset=log(tsplit.Surv$tobs))
-        beta <- matrix(poisson.glm.fit$coefficients, ncol=1)
-        rownames(beta) <- names(poisson.glm.train$coefficients)
+        coeffs <- as.data.table(summary.glm(poissonglm.fit)$coefficients)
     }
+    return(coeffs)
+}
+
+#' Predict event indicators from Poisson regression model using imputed biomarker values from kal.wide
+#' 
+#' @param beta Matrix of regression coefficients with one column.
+#' @param imputed.dt Data.table of imputed values generated by kalmanwide(), one record per person-time interval.
+#' @param dataSurv Data.table with column id used to fit ctsem model.
+#' @param timeinvar.surv Character vector of names of time-invariant covariates in dataSurv.train.
+#' @param biomarkers Character vector of names of biomarkers in dataSurv.train.
+#' @param landmark.time Landmark time for start of prediction, as numeric variable. 
+#' @return Data.table with columns id, event, tstart, tstop, toobs, covariates, p.event, cumulative survival prob for each individual. 
+#' 
+#' @export
+predict.testdata <- function(beta, imputed.dt, dataSurv, timeinvar.surv, biomarkers, landmark.time) {
+    ## left join tsplit.test with dataSurv
+    dataSurv[, Time.cens := max(tstop), by=id]
+    tsplit.test <- imputed.dt
+    setkey(tsplit.test, id, tstart)
+    setkey(dataSurv, id, Time)
+    tsplit.test <- dataSurv[tsplit.test]
+    setnames(tsplit.test, "Time", "tstart")
+    ## tstart is time at which biomarkers are imputed
+    ## restrict to person-time intervals starting after landmark.time 
+    # tsplit.test <- tsplit.test[tstart >= landmark.time]
+ 
+    ## do not truncate last interval at censoring date
+    tobs.max <- with(tsplit.test, max(tstop - tstart, na.rm=TRUE)) # should be timestep
+    tsplit.test[is.na(tstop) | tstop==Time.cens, tstop := tstart + tobs.max] 
+
+    ## calculate tobs for each interval 
+    tsplit.test[, tobs := tstop - tstart]
+    ## set event indicator to 0 for all person-time intervals ending before censoring date
+    if(!is.data.table(tsplit.test))
+        tsplit.test <- as.data.table(tsplit.test)
     
-    return(beta)
+    tsplit.test[, Time.cens := max(tstop), by="id"]
+    tsplit.test[tstop < Time.cens, event := 0]
+    keep.cols <- c("id", "event", "tstart", "tstop", "tobs", timeinvar.surv, biomarkers)
+    tobs <- tsplit.test$tobs
+    tsplit.test <- tsplit.test[, ..keep.cols]
+
+    covariatenames <- c("tstart", timeinvar.surv, biomarkers)
+    X.test <- model.matrix(~ ., data=tsplit.test[, ..covariatenames])
+
+## predict using timestep as offset -- ignore censoring of last interval
+    beta <- matrix(beta[[1]], ncol=1)
+    tsplit.predict <- as.numeric(tobs * exp(X.test %*% beta)) # predict on scale of hazard rate
+    ## calculate prob(events > 0) and cumulative survprob
+    tsplit.test <- data.table(tsplit.test, p.event = 1 - exp(-tsplit.predict))
+    tsplit.test[, survprob := cumprod(1 - p.event), by=id]
+    return(tsplit.test)
 }
 
 #' Summary statistics for predictive performance
@@ -242,56 +373,5 @@ tabulate.predictions <- function(testdata) {
     return(stats)
 }
 
-#' Predict event indicators from Poisson regression model using imputed biomarker values from kal.wide
-#' 
-#' @param beta Matrix of regression coefficients with one column.
-#' @param ids.test Vector of individual identifiers
-#' @param kal.wide Data.table of imputed values generated by kalmanwide(), one record per person-time interval.
-#' @param dataSurv Data.table with column id used to fit ctsem model.
-#' @param timeinvar.surv Character vector of names of time-invariant covariates in dataSurv.train.
-#' @param biomarkers Character vector of names of biomarkers in dataSurv.train.
-#' @param landmark.time Landmark time for start of prediction, as numeric variable. 
-#' @return Data.table with columns id, event, tstart, tstop, toobs, covariates, p.event, cumulative survival prob for each individual. 
-#' 
-#' @export
-test.imputed <- function(beta, ids.test, kal.wide, dataSurv,
-                           landmark.time, 
-                         timeinvar.surv, biomarkers) {
-    tsplit.test <- kal.wide[id %in% ids.test]
-    ## left join tsplit.test with dataSurv 
-    setkey(tsplit.test, id)
-    setkey(dataSurv, id)
-    tsplit.test <- dataSurv[tsplit.test]
-    ## tstart is time at which biomarkers are imputed
-    ## restrict to person-time intervals starting after landmark.time and before censoring date
-    tsplit.test <- tsplit.test[tstart >= landmark.time]
-    tsplit.test <- tsplit.test[tstart < Time.cens]
-    ## set end of each person-time interval
-    tsplit.test[, tstop := c(tstart[-1], NA), by=id]
-
-    ## do not truncate last interval at censoring date
-    tobs.max <- with(tsplit.test, max(tstop - tstart, na.rm=TRUE))
-    tsplit.test[is.na(tstop), tstop := tstart + tobs.max] ## should be timestep
-
-    ## calculate tobs for each interval 
-    tsplit.test[, tobs := tstop - tstart]
-    ## set event indicator to 0 for all person-time intervals ending before censoring date
-    if(!is.data.table(tsplit.test))
-        tsplit.test <- as.data.table(tsplit.test)
-    tsplit.test[tstop < Time.cens, event := 0]
-    #tsplit.test[event==1, tobs := timestep]
-    keep.cols <- c("id", "event", "tstart", "tstop", "tobs", timeinvar.surv, biomarkers)
-    tobs <- tsplit.test$tobs
-    tsplit.test <- tsplit.test[, ..keep.cols]
-
-    covariatenames <- c("tstart", timeinvar.surv, biomarkers)
-    X.test <- model.matrix(~ ., data=tsplit.test[, ..covariatenames])
-
-   ## predict using timestep as offset -- ignore censoring of last interval
-    tsplit.predict <- as.numeric(tobs * exp(X.test %*% beta)) # predict on scale of hazard rate
-    ## calculate prob(events > 0) and cumulative survprob
-    tsplit.test <- data.table(tsplit.test, p.event = 1 - exp(-tsplit.predict))
-    tsplit.test[, survprob := cumprod(1 - p.event), by=id]
-}
 
 
