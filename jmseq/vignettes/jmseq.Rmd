@@ -50,6 +50,14 @@ data(pbc, package="jmseq")
 pbc
 list2env(pbc, envir=environment())
 
+#include event in long data
+surv2 <- copy(dataSurv)
+setnames(surv2,'Time.cens','Time')
+dataLong <- merge(dataLong,surv2,all=TRUE)
+dataLong[,FinalObs := c(rep(0,.N-1),1),by=id]
+dataLong[FinalObs==0,event:= 0]
+dataLong[,trt:=trt[!is.na(trt)],by=id]
+
 nfolds <- 4
 landmark.time <- 5
 maxtime <- 15
