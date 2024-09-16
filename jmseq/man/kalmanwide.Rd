@@ -4,14 +4,16 @@
 \alias{kalmanwide}
 \title{Impute values at beginning of each person-time interval from 0 to maxtime from ctstanfit object using Kalman filter, and cast to wide format}
 \usage{
-kalmanwide(train.fit, timestep, maxtime = maxtime)
+kalmanwide(train.fit, subjects = "all", timestep, timerange)
 }
 \arguments{
 \item{train.fit}{Object of class ctstanfit.}
 
+\item{subjects}{Vector of ids in field subject of train.fit}
+
 \item{timestep}{Interval length.}
 
-\item{maxtime}{Maximum time up to which to generate imputations.}
+\item{timerange}{Vector of length 2: start and end of time range.}
 }
 \value{
 Data.table of imputed values with time in column tstart.

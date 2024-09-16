@@ -68,12 +68,25 @@ listmodels <- function(biomarkers, timeinvar.long) {
                                   TDpredNames=NULL, 
                                   TIpredNames = timeinvar.long,
                                   LAMBDA=diag(numbio))
+    model.lmmdriftdiffevent <- ctsem::ctModel(type='stanct',
+        manifestNames=c(biomarkers,'event'),
+        latentNames=c(biomarkers,'event'),
+        MANIFESTMEANS=matrix(rep(0, numbio+1), nrow=numbio+1),
+        #DRIFT=0, #
+        #DIFFUSION=0,
+        CINT=matrix(paste0(rep('slope', numbio), 1:(numbio+1)), nrow=numbio+1),
+        time="Time",
+        TDpredNames=NULL,
+        TIpredNames = timeinvar.long,
+        LAMBDA=diag(numbio+1))
+    model.lmmdriftdiffevent$manifesttype[3] <- 1
 
     models.list <- list(model.lmm=model.lmm,
                         model.nolmm=model.nolmm,
                         model.lmmdiff=model.lmmdiff,
                         model.lmmdrift=model.lmmdrift,
-                        model.lmmdriftdiff=model.lmmdriftdiff)
+                        model.lmmdriftdiff=model.lmmdriftdiff,
+                        model.lmmdriftdiffevent=model.lmmdriftdiffevent)
     return(models.list)
 }
 
