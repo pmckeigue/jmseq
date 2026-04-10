@@ -13,9 +13,9 @@ vignette: >
 
 ```{r opts, include=FALSE}
 knitr::opts_chunk$set(
-  collapse  = TRUE,
-  comment   = "#>",
-  cache     = TRUE,
+  collapse   = TRUE,
+  comment    = "#>",
+  cache      = TRUE,
   cache.path = "jmseq_cache/",
   fig.width  = 7,
   fig.height = 4
@@ -23,9 +23,21 @@ knitr::opts_chunk$set(
 options(rmarkdown.html_vignette.check_title = FALSE)
 ```
 
-The `jmseq` package fits joint models of longitudinal biomarker trajectories and time-to-event outcomes.  The longitudinal submodel is a continuous-time linear Gaussian state space model (LGSSM) estimated by MAP inference via a JAX Kalman filter and NumPyro.  The survival submodel is a Poisson hazard model that uses the Kalman-filtered states as time-varying covariates.
+The computation in this vignette is performed by the Python package `jmseq`, called from R via the [`reticulate`](https://rstudio.github.io/reticulate/) package.  Results are returned to R as ordinary data frames and lists, and displayed using `ggplot2` and `kableExtra`.
+
+The `jmseq` Python package fits joint models of longitudinal biomarker trajectories and time-to-event outcomes.  The longitudinal submodel is a continuous-time linear Gaussian state space model (LGSSM) estimated by MAP inference using a JAX Kalman filter and NumPyro.  The survival submodel is a Poisson hazard model that takes the Kalman-filtered states as time-varying covariates.
 
 This vignette demonstrates 4-fold cross-validated prediction of mortality on the Mayo Clinic primary biliary cirrhosis (PBC) dataset, comparing a linear mixed model (random slopes only) to a fuller SDE model with autoregressive drift and diffusion.
+
+# Running Python from R with reticulate
+
+The `reticulate` package embeds a Python session inside the R session.  Three functions are used throughout this vignette:
+
+- **`import("module")`** — imports a Python module and returns an R object whose `$` operator maps to Python attribute access.  For example, `jm <- import("jmseq")` makes every public function in `jmseq` available as `jm$function_name(...)`.
+- **`r_to_py(x)`** — converts an R object to its Python equivalent.  R data frames become `pandas.DataFrame` objects; R vectors become numpy arrays.
+- **`py_to_r(x)`** — converts a Python object back to R.  `pandas.DataFrame` → R data frame; Python lists and dicts → R lists.
+
+Python objects returned by functions called via `$` are converted to R automatically when they are standard types (data frames, numeric scalars, strings, lists).  No explicit `py_to_r()` call is needed in most cases.
 
 # Setup
 
@@ -35,24 +47,35 @@ library(ggplot2)
 library(kableExtra)
 library(data.table)
 
+## Specify which Python executable to use.
+## The jmseq Python package must be installed in this Python environment
+## (pip install -e . from the repository root).
 use_python("/usr/bin/python3", required = TRUE)
+
 ggplot2::theme_set(ggplot2::theme_light(base_size = 9))
 ```
 
 ```{r imports, cache=FALSE}
-jm  <- import("jmseq")
-np  <- import("numpy")
-pd  <- import("pandas")
+## import() is the reticulate equivalent of Python's import statement.
+## After these calls, jm$split_surv_long(...) calls jmseq.split_surv_long(...),
+## and so on for every public function in the package.
+jm <- import("jmseq")
+np <- import("numpy")
+pd <- import("pandas")
 ```
 
 # Dataset
 
 The PBC dataset comprises 1945 longitudinal measurements of two biomarkers (log-bilirubin and albumin, both standardised) on 312 individuals followed for mortality up to 15 years from baseline.  Time-invariant covariates are sex, age at baseline, and treatment assignment.
 
-```{r data, cache=FALSE}
-load(system.file("data", "pbc.rda", package = "jmseq"))
+The data are loaded from the R package data object `pbc`, then converted to plain R data frames before being passed to Python.
 
-## convert trt factor to binary (D-penicillamine = 1)
+```{r data, cache=FALSE}
+## Path relative to the vignette directory (jmseq/vignettes/ → jmseq/data/)
+load("../data/pbc.rda")
+
+## Convert the treatment factor to a binary integer (D-penicillamine = 1).
+## The Python pipeline works with numeric covariates only.
 dataSurv_r <- as.data.frame(pbc$dataSurv)
 dataSurv_r$trt_binary <- as.integer(dataSurv_r$trt == "D-penicil")
 dataSurv_r <- dataSurv_r[, c("id", "sex", "agebaseline", "trt_binary",
@@ -71,22 +94,26 @@ cat(sprintf("dataLong: %d observations\n", nrow(dataLong_r)))
 
 ## Preprocessing: interval splitting
 
-Follow-up time is split into intervals of at most 0.25 years.  Biomarker observations recorded within each interval are used to update the Kalman filter state.
+Follow-up time is split into intervals of at most 0.25 years so that the Poisson hazard model approximates a continuous-time process.  Intervals containing a biomarker observation are flagged so the Kalman filter performs an update step; empty intervals carry only a prediction step.
+
+The R data frames are passed to `jm$split_surv_long()` using `r_to_py()`.  The function returns a Python `pandas.DataFrame`, which reticulate automatically converts to an R data frame when it is assigned to an R variable.
 
 ```{r split}
+## r_to_py() converts R data.frames to pandas DataFrames.
 surv_py <- r_to_py(dataSurv_r)
 long_py <- r_to_py(dataLong_r)
 
+## jm$split_surv_long() is the Python function jmseq.split_surv_long().
+## The returned pandas DataFrame is automatically coerced to an R data frame.
 split_df <- jm$split_surv_long(
   surv_py,
   long_py,
-  max_interval  = 0.25,
+  max_interval   = 0.25,
   timeinvar_surv = timeinvar_surv,
   biomarkers     = biomarkers
 )
 
-dataSurv_split <- split_df[c("id", "Time", "tstop", "event",
-                              timeinvar_surv)]
+dataSurv_split <- split_df[c("id", "Time", "tstop", "event", timeinvar_surv)]
 dataLong_split <- split_df[c("id", "Time", "tstop", biomarkers)]
 
 cat(sprintf("After splitting: %d rows, max T per individual = %d\n",
@@ -96,27 +123,44 @@ cat(sprintf("After splitting: %d rows, max T per individual = %d\n",
 
 # Model variants
 
-We compare two LGSSM variants for the biomarker trajectories.
+We compare two LGSSM variants for the biomarker trajectories.  The five available variants are pre-defined in `jmseq.VARIANTS`; `make_config()` selects one by name and sets the state dimension `p`.  In R, integer arguments to Python functions must be written as `2L` rather than `2` to avoid being passed as floating-point.
 
 ```{r configs}
+## make_config() returns a Python LGSSMConfig dataclass, which reticulate
+## exposes as an R list.  The $ operator accesses its fields.
 configs <- list(
   jm$make_config("model_lmm",          p = 2L),
   jm$make_config("model_lmmdriftdiff", p = 2L)
 )
+cat("model_lmm config:  free_drift =", configs[[1]]$free_drift,
+    " free_diffusion =", configs[[1]]$free_diffusion, "\n")
+cat("model_lmmdriftdiff: free_drift =", configs[[2]]$free_drift,
+    " free_diffusion =", configs[[2]]$free_diffusion, "\n")
 ```
 
 The two models differ in whether the SDE drift matrix **A** and diffusion matrix **G** are estimated:
 
-| Model | Drift **A** | Diffusion **G** | Random slope **b** |
-|---|---|---|---|
-| `model_lmm` | fixed 0 | fixed 0 | free |
-| `model_lmmdriftdiff` | free | free | free |
+| Model | Drift **A** | Diffusion **G** | Random slope **b** | Continuous-time SDE |
+|---|:---:|:---:|:---:|---|
+| `model_lmm` | fixed 0 | fixed 0 | free | Random slopes only; reduces to a linear mixed model |
+| `model_lmmdriftdiff` | free | free | free | Full SDE with mean reversion and stochastic volatility |
 
 # Cross-validated prediction
 
-4-fold cross-validation with landmark time 5 years.  For each fold the LGSSM is fitted by MAP to the training data, the Kalman filter is run over all individuals, and a Poisson GLM is fitted using the filtered states as time-varying predictors of the hazard.  Predictive performance is evaluated on the test fold over the window 5–15 years.
+4-fold cross-validation is performed with a landmark time of 5 years; events are predicted over the window 5–15 years.  For each fold:
+
+1. The LGSSM is fitted by MAP to the training individuals' longitudinal data.
+2. The Kalman filter is run over **all** individuals.  For test-fold individuals, biomarker observations after the landmark time are withheld; the filter extrapolates the last known state using the SDE dynamics alone.
+3. A Poisson GLM is fitted to the training data using the Kalman-filtered states as time-varying covariates.
+4. Event probabilities are predicted for test-fold individuals over post-landmark intervals.
+
+`jm$cross_validate()` orchestrates all four steps.  It accepts Python or R data frames transparently (reticulate converts R data frames to `pandas.DataFrame` before the call).  It returns a Python dict mapping model name to a `CVResult` object; reticulate converts this to an R named list.  Individual fields are accessed with `$`, just as with any R list.
 
 ```{r cv, message=FALSE}
+## cross_validate() runs the full CV loop in Python.
+## R data frames are accepted directly — reticulate converts them automatically.
+## The result is a named R list; cv_results[["model_lmm"]]$pooled is an R list
+## of summary statistics.
 cv_results <- jm$cross_validate(
   dataSurv_split,
   dataLong_split,
@@ -128,40 +172,46 @@ cv_results <- jm$cross_validate(
   random_seed    = 1234L,
   lgssm_steps    = 3000L,
   poisson_steps  = 3000L,
-  verbose        = FALSE
+  verbose        = TRUE
 )
 ```
 
+# Results
+
 ## Kalman filter trajectories
 
-The plot below shows the raw biomarker observations (points) and the Kalman-filtered state means (lines) for five individuals from the first cross-validation fold, using `model_lmmdriftdiff`.
+The Kalman filter output is stored in the per-fold prediction data frames inside `cv_results`.  Each data frame contains the Kalman-filtered biomarker state means alongside the event and interval timing columns.  `py_to_r()` converts the Python data frame to an R data frame for plotting with `ggplot2`.
+
+The plot shows the raw biomarker observations (points) and the Kalman-filtered state means (lines) for five individuals from the first cross-validation fold, using `model_lmmdriftdiff`.  Trajectories continue beyond the last observation date because the filter extrapolates using the fitted SDE.
 
 ```{r kalman_plot, fig.height=5}
-## Extract fold-1 prediction data (contains Kalman-filtered biomarker columns)
-pred1 <- py_to_r(cv_results[["model_lmmdriftdiff"]]$fold_pred[[1]])
+## py_to_r() converts a pandas DataFrame to an R data frame.
+## cv_results[["model_lmmdriftdiff"]]$fold_pred is an R list of data frames
+## (one per fold); the first element is the fold-1 test predictions.
+pred1    <- py_to_r(cv_results[["model_lmmdriftdiff"]]$fold_pred[[1]])
 pred1_dt <- as.data.table(pred1)
 
-## Take five representative individuals (first two who died, first three who were censored)
+## Select two individuals who had events and three who were censored.
 ids_event <- head(pred1_dt[event == 1, unique(id)], 2)
 ids_cens  <- head(setdiff(pred1_dt[event == 0, unique(id)], ids_event), 3)
 ids_show  <- unique(c(ids_event, ids_cens))
 
 kalman_long <- melt(
   pred1_dt[id %in% ids_show, .(id, tstart, logBili, albumin)],
-  id.vars    = c("id", "tstart"),
+  id.vars       = c("id", "tstart"),
   variable.name = "biomarker",
   value.name    = "filtered"
 )
 
 obs_long <- melt(
   as.data.table(dataLong_r)[id %in% ids_show, .(id, Time, logBili, albumin)],
-  id.vars    = c("id", "Time"),
+  id.vars       = c("id", "Time"),
   variable.name = "biomarker",
   value.name    = "observed"
 )
 
 kalman_long[, id := factor(id)]
-obs_long[, id := factor(id)]
+obs_long[,   id := factor(id)]
 
 ggplot() +
   geom_line(data  = kalman_long,
@@ -169,11 +219,12 @@ ggplot() +
             linewidth = 0.6) +
   geom_point(data = obs_long,
              aes(x = Time, y = observed, colour = id),
-             size = 1.2, shape = 16) +
+             size = 1.4, shape = 16) +
   facet_wrap(~ biomarker, scales = "free_y",
              labeller = labeller(biomarker = c(logBili = "log-bilirubin",
                                                albumin  = "albumin"))) +
-  labs(x = "Years from baseline", y = "Standardised value",
+  labs(x     = "Years from baseline",
+       y     = "Standardised value",
        colour = "Individual",
        title  = "Kalman-filtered biomarker trajectories (model_lmmdriftdiff, fold 1)") +
   theme(legend.position = "right")
@@ -181,17 +232,19 @@ ggplot() +
 
 ## Per-fold predictive performance
 
+`cv_results[["model_lmm"]]$fold_stats` is a Python list of dicts, which reticulate converts to an R list of named lists.  Standard R functions (`mapply`, `sapply`, etc.) work directly on this structure.
+
 ```{r fold_table}
 get_fold_table <- function(model_name) {
   stats_list <- cv_results[[model_name]]$fold_stats
   rows <- mapply(function(s, i) {
     data.frame(
-      Fold           = i,
-      Observed       = s[["Observed"]],
-      Predicted      = round(s[["Predicted"]], 1),
-      `Log score`    = round(s[["Log score"]], 2),
-      `C-statistic`  = round(s[["C-statistic"]], 3),
-      check.names    = FALSE
+      Fold          = i,
+      Observed      = s[["Observed"]],
+      Predicted     = round(s[["Predicted"]], 1),
+      `Log score`   = round(s[["Log score"]], 2),
+      `C-statistic` = round(s[["C-statistic"]], 3),
+      check.names   = FALSE
     )
   }, stats_list, seq_along(stats_list), SIMPLIFY = FALSE)
   do.call(rbind, rows)
@@ -219,13 +272,13 @@ kable(fold_full,
 make_row <- function(model_name) {
   s <- cv_results[[model_name]]$pooled
   data.frame(
-    Model         = model_name,
-    Observed      = s[["Observed"]],
-    Predicted     = round(s[["Predicted"]], 1),
+    Model          = model_name,
+    Observed       = s[["Observed"]],
+    Predicted      = round(s[["Predicted"]], 1),
     `Person-years` = round(s[["Person-years"]], 0),
-    `Log score`   = round(s[["Log score"]], 2),
-    `C-statistic` = round(s[["C-statistic"]], 3),
-    check.names   = FALSE
+    `Log score`    = round(s[["Log score"]], 2),
+    `C-statistic`  = round(s[["C-statistic"]], 3),
+    check.names    = FALSE
   )
 }
 
@@ -244,26 +297,32 @@ kable(perf_table,
 
 ```{r cstat_plot}
 fold_df <- rbind(
-  data.frame(model = "model_lmm",          fold = 1:4,
-             C = sapply(cv_results[["model_lmm"]]$fold_stats,
-                        `[[`, "C-statistic")),
-  data.frame(model = "model_lmmdriftdiff", fold = 1:4,
-             C = sapply(cv_results[["model_lmmdriftdiff"]]$fold_stats,
-                        `[[`, "C-statistic"))
+  data.frame(model = "model_lmm",
+             fold  = 1:4,
+             C     = sapply(cv_results[["model_lmm"]]$fold_stats,
+                            `[[`, "C-statistic")),
+  data.frame(model = "model_lmmdriftdiff",
+             fold  = 1:4,
+             C     = sapply(cv_results[["model_lmmdriftdiff"]]$fold_stats,
+                            `[[`, "C-statistic"))
 )
 
 ggplot(fold_df, aes(x = factor(fold), y = C, colour = model, group = model)) +
   geom_line(linewidth = 0.7) +
   geom_point(size = 2.5) +
-  geom_hline(data = perf_table,
+  geom_hline(data     = perf_table,
              aes(yintercept = `C-statistic`, colour = Model),
-             linetype = "dashed", linewidth = 0.5) +
+             linetype  = "dashed",
+             linewidth = 0.5) +
   scale_y_continuous(limits = c(0.7, 1.0)) +
-  labs(x = "Fold", y = "C-statistic",
+  labs(x      = "Fold",
+       y      = "C-statistic",
        colour = "Model",
-       title  = "C-statistic per fold (dashed = pooled)") +
+       title  = "C-statistic per fold (dashed line = pooled)") +
   theme(legend.position = "bottom")
 ```
+
+The C-statistic and log-score are both computed over all person-time intervals from the landmark time to exit, treating each interval as an independent binary observation (event / no event).  The C-statistic is the area under the ROC curve of the predicted interval-event probability; the log-score is the sum of the Bernoulli log-likelihoods.
 
 # Methods summary
 
@@ -271,12 +330,10 @@ The two-step procedure is:
 
 1. **LGSSM** — a continuous-time SDE
    $$dX(t) = (AX(t) + b)\,dt + G\,dW(t), \quad y_t = x_t + v_t, \quad v_t \sim N(0,R)$$
-   is fitted to the longitudinal data by MAP inference (NumPyro SVI with an `AutoDelta` guide).  Discrete-time transition matrices $A_d(\Delta t) = \exp(A\,\Delta t)$ and process noise $Q_d(\Delta t)$ are obtained via the Van Loan method.
+   is fitted to the longitudinal data by MAP inference (NumPyro SVI with an `AutoDelta` guide and `ClippedAdam` optimiser).  Discrete-time transition matrices $A_d(\Delta t) = \exp(A\,\Delta t)$ and process noise $Q_d(\Delta t)$ are obtained via the Van Loan method, implemented with a fixed-order degree-7 Padé matrix exponential that contains no data-dependent conditionals and therefore compiles efficiently under JAX.
 
-2. **Kalman filter** — the filtered state means $\hat x_t$ are extracted for each person-time interval.  In the test fold, biomarker observations after the landmark time are withheld; the filter propagates the last observed state forward using only the SDE dynamics.
+2. **Kalman filter** — implemented in JAX using `jax.lax.scan` over time steps and `jax.vmap` over individuals.  Filtered state means $\hat x_t$ are extracted for each person-time interval.  In the test fold, biomarker observations after the landmark time are withheld; the filter propagates the last observed state forward using only the SDE dynamics.
 
 3. **Poisson GLM** — the log-hazard is modelled as
    $$\log \lambda_i(t) = \beta_0 + \beta_t t + \beta_x \hat x_i(t) + \beta_z z_i$$
-   where $z_i$ are time-invariant covariates.  Fitted with QR decomposition for numerical stability.
-
-The **C-statistic** and **log-score** are both computed over all person-time intervals from the landmark time to exit, treating each interval as an independent binary observation.
+   where $z_i$ are time-invariant covariates.  Fitted by MAP using QR decomposition of the design matrix for numerical stability.

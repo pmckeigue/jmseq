@@ -79,14 +79,17 @@ def cross_validate(
     if isinstance(configs, list):
         configs = {c.name: c for c in configs}
 
-    # Individuals at risk after landmark
-    surv_once = dataSurv.drop_duplicates(subset=[id_col])
-    ids_at_risk = surv_once.loc[
-        surv_once.groupby(id_col)["tstop"].transform("max") > landmark_time, id_col
-    ].unique()
-    # Use Time.cens if present, otherwise derive from max tstop per individual
-    if "Time.cens" in dataSurv.columns or "Time" in dataSurv.columns:
-        pass  # ids_at_risk already computed above
+    # Individuals at risk after landmark: keep those whose last tstop > landmark_time.
+    # Use Time.cens column when present (raw survival data); otherwise derive from
+    # max tstop across all interval rows for each individual (split survival data).
+    if "Time.cens" in dataSurv.columns:
+        first_row = dataSurv.drop_duplicates(subset=[id_col])
+        ids_at_risk = first_row.loc[
+            first_row["Time.cens"] > landmark_time, id_col
+        ].to_numpy()
+    else:
+        max_tstop   = dataSurv.groupby(id_col)["tstop"].max()
+        ids_at_risk = max_tstop.index[max_tstop > landmark_time].to_numpy()
 
     rng = np.random.default_rng(random_seed)
     ids_perm = rng.permutation(ids_at_risk)
