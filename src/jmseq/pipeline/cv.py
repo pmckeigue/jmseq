@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 
-from jmseq.models.model_config import LGSSMConfig
+from jmseq.models.model_config import LGSSMConfig, make_config
 from jmseq.data.splits import trainsplit_surv, trainsplit_long
 from jmseq.pipeline.train import fit_lgssm_fold, run_kalman_fold, fit_poisson_fold
 from jmseq.pipeline.predict import predict_testdata, tabulate_predictions
@@ -37,9 +37,11 @@ class CVResult:
 def cross_validate(
     dataSurv: pd.DataFrame,
     dataLong: pd.DataFrame,
-    configs: list[LGSSMConfig] | dict[str, LGSSMConfig],
     biomarker_cols: list[str],
     timeinvar_surv: list[str],
+    configs: list[LGSSMConfig] | dict[str, LGSSMConfig] | None = None,
+    model_names: list[str] | None = None,
+    p: int = 2,
     landmark_time: float = 5.0,
     n_folds: int = 4,
     random_seed: int = 1234,
@@ -58,9 +60,14 @@ def cross_validate(
     ----------
     dataSurv        : interval-split survival data [id, Time, tstop, event, *timeinvar].
     dataLong        : interval-split longitudinal data [id, Time, *biomarkers].
-    configs         : LGSSMConfig objects — list or {name: config} dict.
     biomarker_cols  : biomarker column names.
     timeinvar_surv  : time-invariant covariate names.
+    configs         : LGSSMConfig objects — list or {name: config} dict.
+                      Mutually exclusive with model_names.
+    model_names     : list of model name strings (e.g. ["model_lmm", "model_lmmdriftdiff"]).
+                      Preferred when calling from R via reticulate to avoid passing Python
+                      objects across the language boundary.  Mutually exclusive with configs.
+    p               : state dimension (number of biomarkers).  Used only with model_names.
     landmark_time   : start of prediction window (years).
     n_folds         : number of CV folds.
     random_seed     : for fold assignment.
@@ -76,8 +83,12 @@ def cross_validate(
     Dict mapping model name → CVResult.
     """
     # Normalise configs to {name: config}
-    if isinstance(configs, list):
+    if model_names is not None:
+        configs = {name: make_config(name, p=p) for name in model_names}
+    elif isinstance(configs, list):
         configs = {c.name: c for c in configs}
+    elif configs is None:
+        raise ValueError("Either configs or model_names must be provided")
 
     # Individuals at risk after landmark: keep those whose last tstop > landmark_time.
     # Use Time.cens column when present (raw survival data); otherwise derive from

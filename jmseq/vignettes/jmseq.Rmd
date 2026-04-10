@@ -123,19 +123,19 @@ cat(sprintf("After splitting: %d rows, max T per individual = %d\n",
 
 # Model variants
 
-We compare two LGSSM variants for the biomarker trajectories.  The five available variants are pre-defined in `jmseq.VARIANTS`; `make_config()` selects one by name and sets the state dimension `p`.  In R, integer arguments to Python functions must be written as `2L` rather than `2` to avoid being passed as floating-point.
+We compare two LGSSM variants for the biomarker trajectories.  The five available variants are pre-defined in `jmseq.VARIANTS`; `make_config()` selects one by name and sets the state dimension `p`.  Calling `make_config()` via reticulate returns a Python `LGSSMConfig` dataclass, which reticulate exposes as an R environment whose fields are accessed with `$`.
 
 ```{r configs}
-## make_config() returns a Python LGSSMConfig dataclass, which reticulate
-## exposes as an R list.  The $ operator accesses its fields.
-configs <- list(
-  jm$make_config("model_lmm",          p = 2L),
-  jm$make_config("model_lmmdriftdiff", p = 2L)
-)
-cat("model_lmm config:  free_drift =", configs[[1]]$free_drift,
-    " free_diffusion =", configs[[1]]$free_diffusion, "\n")
-cat("model_lmmdriftdiff: free_drift =", configs[[2]]$free_drift,
-    " free_diffusion =", configs[[2]]$free_diffusion, "\n")
+## make_config() returns a Python LGSSMConfig dataclass.
+## Reticulate exposes Python dataclasses as R environments; fields are accessed with $.
+## Note the 2L — R passes plain 2 as a double (float), not an integer, so Python
+## keyword arguments that expect int must be annotated with L.
+lmm_cfg  <- jm$make_config("model_lmm",          p = 2L)
+full_cfg  <- jm$make_config("model_lmmdriftdiff", p = 2L)
+cat("model_lmm:          free_drift =", lmm_cfg$free_drift,
+    " free_diffusion =", lmm_cfg$free_diffusion, "\n")
+cat("model_lmmdriftdiff: free_drift =", full_cfg$free_drift,
+    " free_diffusion =", full_cfg$free_diffusion, "\n")
 ```
 
 The two models differ in whether the SDE drift matrix **A** and diffusion matrix **G** are estimated:
@@ -154,19 +154,26 @@ The two models differ in whether the SDE drift matrix **A** and diffusion matrix
 3. A Poisson GLM is fitted to the training data using the Kalman-filtered states as time-varying covariates.
 4. Event probabilities are predicted for test-fold individuals over post-landmark intervals.
 
-`jm$cross_validate()` orchestrates all four steps.  It accepts Python or R data frames transparently (reticulate converts R data frames to `pandas.DataFrame` before the call).  It returns a Python dict mapping model name to a `CVResult` object; reticulate converts this to an R named list.  Individual fields are accessed with `$`, just as with any R list.
+`jm$cross_validate()` orchestrates all four steps.  It accepts R data frames directly; reticulate converts them to `pandas.DataFrame` automatically before the call.
+
+Model variants are specified via `model_names` — a plain R character vector of model name strings.  Passing model names rather than Python config objects avoids the complexity of marshalling Python dataclass instances across the R/Python boundary: the Python function constructs the `LGSSMConfig` objects itself from the names.
+
+`cross_validate()` returns a Python dict mapping model name to a `CVResult` object.  Reticulate converts this dict to an R named list, and the `CVResult` fields are accessible with `$`.
 
 ```{r cv, message=FALSE}
 ## cross_validate() runs the full CV loop in Python.
-## R data frames are accepted directly — reticulate converts them automatically.
-## The result is a named R list; cv_results[["model_lmm"]]$pooled is an R list
-## of summary statistics.
+## model_names is passed as a plain R character vector — no Python objects cross
+## the language boundary.  R data frames are accepted directly and converted
+## to pandas DataFrames automatically by reticulate.
+## The returned dict of CVResult objects becomes an R named list;
+## cv_results[["model_lmm"]]$pooled is an R list of performance statistics.
 cv_results <- jm$cross_validate(
   dataSurv_split,
   dataLong_split,
-  configs        = configs,
   biomarker_cols = biomarkers,
   timeinvar_surv = timeinvar_surv,
+  model_names    = c("model_lmm", "model_lmmdriftdiff"),
+  p              = 2L,
   landmark_time  = 5.0,
   n_folds        = 4L,
   random_seed    = 1234L,
