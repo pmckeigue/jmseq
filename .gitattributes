@@ -1,0 +1,7 @@
+# Mark legacy R package files as documentation so GitHub Linguist
+# excludes them from language statistics
+jmseq/vignettes/**   linguist-documentation=true
+jmseq/R/**           linguist-documentation=true
+jmseq/man/**         linguist-documentation=true
+jmseq/stan/**        linguist-documentation=true
+jmseq/data/**        linguist-documentation=true
